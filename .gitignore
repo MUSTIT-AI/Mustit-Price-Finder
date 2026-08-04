@@ -1,0 +1,31 @@
+# ── 시크릿 / 설정 (절대 커밋 금지) ──────────────────────────────
+api_keys.json
+.env
+.env.*
+
+# ── 데이터 (Railway /data 볼륨, 로컬 생성물) ───────────────────
+*.db
+*.db-wal
+*.db-shm
+mustit_sellers.db
+mustit_sellers.csv
+
+# ── 크롤링 테스트 산출물 / 로그인 세션 ────────────────────────
+pw_profile/
+naver_headed.html
+naver_next.json
+naver_raw.html
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── OS / 에디터 ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
