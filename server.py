@@ -17,7 +17,7 @@ try:
     _HAS_PLAYWRIGHT = True
 except ImportError:
     _HAS_PLAYWRIGHT = False
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, send_from_directory, after_this_request
 
@@ -226,43 +226,21 @@ def call_api_asc_from_floor(query: str, floor_price: int, max_items: int = 200) 
 
 
 def search(query, ref_price=0, top_n=10):
-    # Step 1: sim 200개 (네이버쇼핑 랭킹순)
-    sim_items = call_api(query, 200, "sim")
-
-    # Step 2: anchor = sim 1위 상품 가격
-    anchor_price = get_anchor_price(sim_items)
-    price_floor  = int(anchor_price * MUSTIT_PRICE_FLOOR_RATIO) if anchor_price > 0 else 0
-
-    # Step 3: asc 1위부터 탐색, floor 이상 첫 상품부터 200개 수집
-    asc_items = call_api_asc_from_floor(query, price_floor, 200)
-
+    """플랫폼 구분 없이 통합 가격순 top_n. D안 전환 후에는 search_by_platform의
+    Phase-1 결과(_BYPLAT_CACHE 재사용)를 펼쳐서 재사용 — 몰 검색 API 중복 호출 방지."""
+    by_plat, _, _, _ = search_by_platform(query, ref_price, top_n=50, skip_enrich=True)
     results = []
-    seen    = set()
-    for item in asc_items:
-        p_str = item.get("lprice","0")
-        price = int(p_str) if p_str.isdigit() else 0
-        if price == 0: continue
-        plat = detect_platform(item)
-        if plat is None: continue
-        # anchor 최저가 기준 -30% 미만 제품 제외
-        if price_floor > 0 and price < price_floor:
-            continue
-        # 판매자 ID: 스마트스토어의 경우 mallName이 곧 개별 셀러 스토어명.
-        # 트렌비/SSG/롯데ON/머스트잇은 mallName이 플랫폼 자신이며 셀러도 동일.
-        seller = (item.get("mallName") or "").strip() or plat
-        # 동일 (플랫폼, 셀러, 링크) 중복 제거
-        key  = f"{plat}|{seller}|{item.get('link','')}"
-        if key in seen: continue
-        seen.add(key)
-        results.append({
-            "rank": 0, "platform": plat, "seller": seller,
-            "name":  strip_html(item.get("title","")),
-            "price": price,
-            "image": item.get("image",""),
-            "link":  item.get("link",""),
-            "brand": strip_html(item.get("brand","")),
-        })
-        if len(results) >= top_n * 6: break
+    for plat, lst in by_plat.items():
+        for it in lst:
+            results.append({
+                "rank": 0, "platform": plat,
+                "seller": it.get("seller") or it.get("mallName") or plat,
+                "name":  it.get("name", ""),
+                "price": it.get("price", 0),
+                "image": it.get("image", ""),
+                "link":  it.get("link", ""),
+                "brand": it.get("brand", ""),
+            })
     results.sort(key=lambda x: x["price"])
     for i, r in enumerate(results): r["rank"] = i+1
     return results[:top_n]
@@ -305,16 +283,271 @@ def _extract_naver_nmid(link: str) -> str:
     return ""
 
 
+# ── D안: 5개몰 자체 검색 직접 연동 (네이버 쇼핑 검색 API 대체) ──────────────────────
+# 네이버 쇼핑 검색 API 종료(2026-08-01)로 상품 목록 획득 방식을 몰별 자체 검색으로 교체.
+# 각 함수는 공통 shape의 dict 리스트를 반환: name, price, image, link, brand, mallName.
+# 스마트스토어는 서버 IP에서 429로 전면 차단되어(코드 내 scrape_seller_id 기존 주석 참고)
+# 자체 검색 연동이 불가능 — by_plat["스마트스토어"]는 항상 빈 리스트로 유지됨.
+
+def _fetch_mustit_search(query, max_items=100, sort="LOW_PRICE"):
+    """머스트잇 자체 검색 API(m.web.mustit.co.kr facade). 세션/쿠키/Playwright 불필요.
+    페이지네이션 미지원 확인됨 — 키워드+정렬당 최대 40개 정도만 반환."""
+    try:
+        r = requests.get(
+            "https://m.web.mustit.co.kr/v2/api/facade/searchItems",
+            params={"keyword": query, "sort": sort},
+            headers={"X-Route-Token": "Next-Route-Token",
+                     "User-Agent": _UA, "Accept": "application/json"},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+    except Exception:
+        return []
+
+    raw_items = []
+    def _walk(node):
+        if isinstance(node, dict):
+            if "itemNo" in node and "price" in node:
+                raw_items.append(node)
+                return
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+    _walk(data)
+
+    items, seen_no = [], set()
+    for it in raw_items:
+        item_no = it.get("itemNo")
+        if item_no is None or item_no in seen_no:
+            continue
+        seen_no.add(item_no)
+        price_str = re.sub(r"[^\d]", "", str(it.get("price", "0")))
+        price = int(price_str) if price_str.isdigit() and price_str else 0
+        if price == 0:
+            continue
+        img_list = it.get("imageUrlList") or []
+        link = it.get("landingUrl") or f"https://m.web.mustit.co.kr/v2/m/product/product_detail/{item_no}"
+        items.append({
+            "name": it.get("name", ""),
+            "price": price,
+            "image": img_list[0] if img_list else "",
+            "link": link,
+            "brand": it.get("brandName", ""),
+            "mallName": "머스트잇",
+        })
+        if len(items) >= max_items:
+            break
+    items.sort(key=lambda x: x["price"])
+    return items
+
+
+def _fetch_trenbe_search(query, max_items=100, sort="price"):
+    """트렌비 자체 검색 API(displaygateway.trenbe.com/v3/products).
+    pc-id 헤더만 있으면 세션/쿠키 없이 동작 (임의 값 통과 확인됨)."""
+    items = []
+    page, total_pages = 1, 1
+    while len(items) < max_items and page <= total_pages and page <= 10:
+        try:
+            r = requests.get(
+                "https://displaygateway.trenbe.com/v3/products",
+                params={"search": query, "page": page, "sort": sort,
+                        "sceneName": "result", "brandType": 0},
+                headers={"Accept": "application/json", "pc-id": "990112233",
+                         "User-Agent": _UA, "Referer": "https://www.trenbe.com/"},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                break
+            payload = r.json()
+        except Exception:
+            break
+        data = payload.get("data") or {}
+        products = data.get("products") or []
+        if not products:
+            break
+        total_pages = data.get("totalPages", page)
+        for p in products:
+            raw_id = str(p.get("id", "")).lstrip("+")
+            if not raw_id.isdigit():
+                continue
+            price = p.get("finalPrice") or p.get("preSalePrice") or 0
+            price = int(price) if price else 0
+            if price == 0:
+                continue
+            images = p.get("images") or []
+            items.append({
+                "name": p.get("title", ""),
+                "price": price,
+                "image": p.get("thumbnail") or (images[0] if images else ""),
+                "link": f"https://www.trenbe.com/good/{raw_id}",
+                "brand": p.get("brandName", ""),
+                "mallName": "트렌비",
+            })
+            if len(items) >= max_items:
+                break
+        page += 1
+    items.sort(key=lambda x: x["price"])
+    return items
+
+
+def _fetch_lotteon_search(query, max_items=100):
+    """롯데온 자체 검색 API(lotteon.com/csearch/search/search). 세션/쿠키 불필요.
+    검색 결과에는 판매자명이 없어(storeName 항상 빈값) seller는 이후 enrich 단계에서
+    _fetch_lotteon_detail로 채워짐(scrape_seller_id에 이미 연결돼 있음)."""
+    items = []
+    offset, page_size = 0, 60
+    while len(items) < max_items and offset < 300:
+        try:
+            r = requests.get(
+                "https://www.lotteon.com/csearch/search/search",
+                params={"q": query, "render": "qapi", "platform": "pc",
+                        "collection_id": 9, "mallId": 1,
+                        "u2": page_size, "u3": page_size, "u39": offset,
+                        "u16": "price.asc", "u37": "true"},
+                headers={"Accept": "application/json", "User-Agent": _UA,
+                         "Referer": "https://www.lotteon.com/"},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+        except Exception:
+            break
+        item_list = data.get("itemList") or []
+        if not item_list:
+            break
+        for it in item_list:
+            price_info = it.get("priceInfo") or {}
+            price_str = re.sub(r"[^\d]", "", str(price_info.get("finalPrice", "0")))
+            price = int(price_str) if price_str.isdigit() and price_str else 0
+            if price == 0:
+                continue
+            pd_link = it.get("pdLink", "") or ""
+            link = f"https://www.lotteon.com{pd_link}" if pd_link.startswith("/") else pd_link
+            pd_image = it.get("pdImage", "") or ""
+            image = f"https://contents.lotteon.com{pd_image}" if pd_image.startswith("/") else pd_image
+            items.append({
+                "name": it.get("pdName", ""),
+                "price": price,
+                "image": image,
+                "link": link,
+                "brand": it.get("brandName", ""),
+                "mallName": "롯데온",
+            })
+            if len(items) >= max_items:
+                break
+        offset += page_size
+    items.sort(key=lambda x: x["price"])
+    return items
+
+
+def _parse_ssg_next_data(html):
+    """SSG 검색 페이지 HTML에서 __NEXT_DATA__ JSON을 파싱해 상품 리스트(dataList) 추출."""
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return []
+    try:
+        next_data = json.loads(m.group(1))
+    except Exception:
+        return []
+    try:
+        for q in next_data["props"]["pageProps"]["dehydratedState"]["queries"]:
+            qk = q.get("queryKey")
+            if isinstance(qk, list) and "fetchSearchItemListArea" in qk:
+                for area in (q.get("state", {}).get("data", {}) or {}).get("areaList", []):
+                    if area.get("dataList"):
+                        return area["dataList"]
+    except Exception:
+        pass
+    return []
+
+
+def _fetch_ssg_search(query, max_items=80):
+    """SSG 자체 검색(www.ssg.com/search.ssg). 별도 JSON API 없이 SSR HTML 안의
+    __NEXT_DATA__ 블록을 파싱. plain requests/curl_cffi(TLS impersonation만)는
+    Akamai Bot Manager의 센서(bm_sz) 쿠키가 없어 403 차단됨 — 실제 JS를 실행하는
+    Playwright 컨텍스트(_get_pw_ssg_context)로 방문해야 통과함.
+    seller(siteName)는 오픈마켓 상품은 비어있어 이후 enrich 단계에서 _fetch_ssg_detail로 폴백됨."""
+    ctx = _get_pw_ssg_context()
+    if ctx is None:
+        return []
+    items = []
+    page = 1
+    while len(items) < max_items and page <= 3:
+        pw_page = None
+        try:
+            pw_page = ctx.new_page()
+            url = ("https://www.ssg.com/search.ssg?target=all"
+                   f"&query={quote(query)}&page={page}&sort=prcasc")
+            pw_page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            pw_page.wait_for_timeout(800)
+            html = pw_page.content()
+        except Exception:
+            break
+        finally:
+            if pw_page:
+                pw_page.close()
+        data_list = _parse_ssg_next_data(html)
+        if not data_list:
+            break
+        for it in data_list:
+            price_info = it.get("priceInfo") or {}
+            price_str = re.sub(r"[^\d]", "", str(price_info.get("rawPrimaryPrice", "0")))
+            price = int(price_str) if price_str.isdigit() and price_str else 0
+            if price == 0:
+                continue
+            items.append({
+                "name": it.get("itemName", ""),
+                "price": price,
+                "image": it.get("itemImgUrl", ""),
+                "link": it.get("itemUrl", ""),
+                "brand": "",
+                "mallName": it.get("siteName") or "SSG",
+            })
+            if len(items) >= max_items:
+                break
+        page += 1
+    items.sort(key=lambda x: x["price"])
+    return items
+
+
+def _fetch_all_malls(query, max_items=100):
+    """5개몰 자체 검색을 병렬 호출해 플랫폼별 원시 아이템 리스트를 반환.
+    스마트스토어는 서버 IP 전면 차단(429)으로 D안 미지원 — 항상 빈 리스트."""
+    fetchers = {
+        "머스트잇": _fetch_mustit_search,
+        "트렌비":   _fetch_trenbe_search,
+        "롯데온":   _fetch_lotteon_search,
+        "SSG":     _fetch_ssg_search,
+    }
+    results = {"스마트스토어": []}
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as ex:
+        futs = {ex.submit(fn, query, max_items): plat for plat, fn in fetchers.items()}
+        for f, plat in futs.items():
+            try:
+                results[plat] = f.result(timeout=20)
+            except Exception:
+                results[plat] = []
+    return results
+
+
 def search_by_platform(query, ref_price=0, top_n=10, skip_enrich=False):
     """각 플랫폼별로 독립적으로 가격 오름차순 정렬 후 top_n개 + 플랫폼 내부 순위 부여.
-    5개 주요 몰(머스트잇/트렌비/SSG/롯데온/스마트스토어)에 해당 없는 항목은 "기타" 버킷에 담아
-    mallName을 그대로 seller(=사이트명)로 노출.
-    각 항목에는 네이버쇼핑 기본 랭킹순 노출 순위(naver_rank)도 부가.
+    D안: 네이버 쇼핑 검색 API 대신 4개몰(머스트잇/트렌비/SSG/롯데온) 자체 검색 API를
+    병렬로 직접 호출 (_fetch_all_malls). 스마트스토어는 서버 IP 전면 차단으로 D안 미지원
+    — by_plat["스마트스토어"]는 항상 빈 리스트. "기타" 버킷도 D안에서는 채워지지 않음
+    (네이버쇼핑 통합검색이 없어 5개몰 외 판매처를 발견할 방법이 없음).
+    naver_rank/naver_nmid는 네이버쇼핑 노출순위/CPC 링크용 필드였으나 데이터 소스 교체로
+    더 이상 의미가 없어 None/빈값으로 유지 (프론트 호환성 위해 필드 자체는 남김).
     skip_enrich=True 이면 enrich_sellers_in_place 를 건너뜀 (Phase-1 fast path).
-    Phase-2(skip_enrich=False)는 Phase-1 캐시를 재사용해 Naver API 재호출 생략."""
+    Phase-2(skip_enrich=False)는 Phase-1 캐시를 재사용해 몰 검색 API 재호출 생략."""
     _cache_key = (query, ref_price, top_n)
 
-    # ── Phase-2: 캐시된 by_plat 재사용 (Naver API 재호출 없음) ──
+    # ── Phase-2: 캐시된 by_plat 재사용 (몰 검색 API 재호출 없음) ──
     if not skip_enrich:
         _ce = _BYPLAT_CACHE.get(_cache_key)
         if _ce and (time.time() - _ce[0]) < _BYPLAT_TTL:
@@ -326,68 +559,42 @@ def search_by_platform(query, ref_price=0, top_n=10, skip_enrich=False):
             )
             return by_plat, enrich_timing, _cached_mustit, _cached_anchor_p
 
-    # ── Step 1: sim 200개 (네이버쇼핑 랭킹순) ────────────────────────────────────────
-    sim_items = call_api(query, 200, "sim")
-
-    # rank_map: sim 순서 → 네이버쇼핑 노출순위
-    rank_map = {}
-    for _idx, _it in enumerate(sim_items):
-        _lnk = (_it.get("link") or "").strip()
-        if _lnk and _lnk not in rank_map:
-            rank_map[_lnk] = _idx + 1
-
-    # ── Step 2: anchor = sim 1위 상품 가격 ────────────────────────────────────────
-    anchor_price = get_anchor_price(sim_items)
-    anchor_plat  = None
-    mustit_min_price = anchor_price
-    price_floor  = int(anchor_price * MUSTIT_PRICE_FLOOR_RATIO) if anchor_price > 0 else 0
-
-    # ── Step 3: asc 1위부터 탐색, floor 이상 첫 상품부터 200개 수집 ──────────────────
-    asc_items = call_api_asc_from_floor(query, price_floor, 200)
+    # ── 4개몰 자체 검색 병렬 호출 ────────────────────────────────────────────────
+    raw_by_plat = _fetch_all_malls(query, max_items=100)
 
     by_plat  = {p: [] for p in PLATFORM_MAP}
     by_plat["기타"] = []
     seen    = set()
-    for item in asc_items:
-        p_str = item.get("lprice", "0")
-        price = int(p_str) if p_str.isdigit() else 0
-        if price == 0: continue
-        # anchor 최저가 기준 -30% 미만 제품 제외
-        if price_floor > 0 and price < price_floor:
-            continue
-        plat = detect_platform(item)
-        mall_raw = (item.get("mallName") or "").strip()
-        link_raw = item.get("link", "")
-        # 네이버 가격비교 카탈로그 URL 제외 (search.shopping.naver.com/catalog/...)
-        if "search.shopping.naver.com/catalog/" in link_raw:
-            continue
-        is_other = plat is None
-        if is_other:
-            if not mall_raw: continue   # 정체불명 항목은 스킵
-            plat = "기타"
-        # dedup 키에는 mallName을 써서 동일 셀러 중복만 거름
-        key = f"{plat}|{mall_raw}|{link_raw}"
-        if key in seen: continue
-        seen.add(key)
-        link = link_raw
-        by_plat[plat].append({
-            "rank": 0, "platform": plat,
-            # 기타 버킷은 mallName이 곧 사이트명. 5개 주요 몰은 이후 enrich 단계에서 채워짐.
-            "seller": mall_raw if is_other else "",
-            "mallName": mall_raw,
-            "name":  strip_html(item.get("title", "")),
-            "price": price,
-            "image": item.get("image", ""),
-            "link":  link,
-            "brand": strip_html(item.get("brand", "")),
-            # 네이버쇼핑 기본 랭킹순 노출 순위 (미발견 시 None)
-            "naver_rank": rank_map.get(link),
-            # nvMid: Naver 고유 mall 상품 ID — link URL의 nvMid= 파라미터에서 추출.
-            # 없으면 productId(API 반환값)를 폴백으로 사용.
-            # search.shopping.naver.com/product/<id> 경유 시 CPC 할인 자동 적용됨.
-            "naver_nmid":       _extract_naver_nmid(link),
-            "naver_product_id": item.get("productId", ""),
-        })
+    for plat, raw_items in raw_by_plat.items():
+        for item in raw_items:
+            price = int(item.get("price", 0) or 0)
+            if price == 0: continue
+            mall_raw = (item.get("mallName") or plat).strip()
+            link_raw = item.get("link", "")
+            if not link_raw: continue
+            key = f"{plat}|{mall_raw}|{link_raw}"
+            if key in seen: continue
+            seen.add(key)
+            by_plat[plat].append({
+                "rank": 0, "platform": plat,
+                # seller는 이후 enrich 단계(enrich_sellers_in_place)에서 채워짐.
+                "seller": "",
+                "mallName": mall_raw,
+                "name":  strip_html(item.get("name", "")),
+                "price": price,
+                "image": item.get("image", ""),
+                "link":  link_raw,
+                "brand": strip_html(item.get("brand", "")),
+                # D안 전환으로 네이버쇼핑 노출순위/nmid 소스가 없어짐 — 필드는 호환성 위해 유지.
+                "naver_rank": None,
+                "naver_nmid":       "",
+                "naver_product_id": "",
+            })
+    # anchor: 기존엔 네이버 sim 1위 가격이었으나, D안에서는 머스트잇 자체 최저가로 대체.
+    mustit_prices = [it["price"] for it in by_plat.get("머스트잇", [])]
+    mustit_min_price = min(mustit_prices) if mustit_prices else 0
+    anchor_plat = "머스트잇" if mustit_min_price else None
+
     # 플랫폼 내부 가격 오름차순 정렬 + 플랫폼 내 순위 부여 + top_n 컷
     for plat, lst in by_plat.items():
         lst.sort(key=lambda x: x["price"])
@@ -584,6 +791,9 @@ _PW_BROWSER_LOCK = threading.Lock()
 _PW_CTX        = None   # 쿠키가 살아있는 공유 브라우저 컨텍스트
 _PW_CTX_LOCK   = threading.Lock()
 
+_PW_SSG_CTX      = None   # SSG 전용 브라우저 컨텍스트 (Akamai 센서 쿠키 유지)
+_PW_SSG_CTX_LOCK = threading.Lock()
+
 # Cloudflare / 자동화 감지 우회용 스텔스 스크립트
 _PW_STEALTH_JS = """
 // webdriver 플래그 제거
@@ -709,6 +919,44 @@ def _get_pw_context():
         except Exception as e:
             print(f"[mustit-pw] context init failed: {e}")
     return _PW_CTX
+
+
+def _get_pw_ssg_context():
+    """SSG(ssg.com) 전용 공유 브라우저 컨텍스트. curl_cffi(TLS impersonation)로는
+    Akamai Bot Manager의 센서(bm_sz) 쿠키가 생성되지 않아 /search.ssg가 403으로 막힘 —
+    실제 JS를 실행하는 Playwright 페이지 방문으로 정상적인 센서 쿠키를 확보한다."""
+    global _PW_SSG_CTX
+    if _PW_SSG_CTX is not None:
+        return _PW_SSG_CTX
+    browser = _get_pw_browser()
+    if not browser:
+        return None
+    with _PW_SSG_CTX_LOCK:
+        if _PW_SSG_CTX is not None:
+            return _PW_SSG_CTX
+        try:
+            ctx = browser.new_context(
+                locale="ko-KR",
+                user_agent=_UA,
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9"},
+            )
+            ctx.add_init_script(_PW_STEALTH_JS)
+            ctx.route(
+                "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,otf}",
+                lambda r: r.abort(),
+            )
+            warmup = ctx.new_page()
+            print("[ssg-pw] warming up context on ssg.com ...")
+            warmup.goto("https://www.ssg.com/", wait_until="domcontentloaded", timeout=30000)
+            warmup.wait_for_timeout(1500)   # Akamai 센서 데이터 전송 대기
+            cookies_after = ctx.cookies()
+            print(f"[ssg-pw] warmup done, total_cookies={len(cookies_after)}")
+            warmup.close()
+            _PW_SSG_CTX = ctx
+        except Exception as e:
+            print(f"[ssg-pw] context init failed: {e}")
+    return _PW_SSG_CTX
 
 
 def _fetch_mustit_html_playwright(pd_id):
