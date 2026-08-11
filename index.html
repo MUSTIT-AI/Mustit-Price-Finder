@@ -337,6 +337,10 @@ body{font-family:-apple-system,"Noto Sans KR",sans-serif;background:var(--bg);co
       </div>
       <div class="ph-name" id="phname">검색 결과</div>
       <div class="ph-lowprice"><span class="ph-lbl">네이버쇼핑 최저가</span><span class="p" id="phprice">—</span></div>
+      <div class="ph-lowprice" id="phnaverref" style="display:none">
+        <span class="ph-lbl">네이버 참고 최저가(스마트스토어 등 포함, 몰 구분 없음)</span>
+        <span class="p" id="phnaverrefprice">—</span>
+      </div>
     </div>
   </div>
 
@@ -856,6 +860,15 @@ function renderAll(data){
   document.getElementById('phcode').textContent=data.query;
   document.getElementById('phname').textContent=top?.name||data.query;
   document.getElementById('phprice').textContent=top?top.price.toLocaleString('ko-KR')+'원':'—';
+  const naverRef = data.naver_reference_price;
+  const naverRefEl = document.getElementById('phnaverref');
+  if(naverRef && naverRef.price > 0){
+    document.getElementById('phnaverrefprice').textContent =
+      naverRef.price.toLocaleString('ko-KR')+'원 ('+naverRef.match_count+'건 매칭)';
+    naverRefEl.style.display = 'block';
+  } else {
+    naverRefEl.style.display = 'none';
+  }
   const img=document.getElementById('phimg');
   img.src=top?.image||''; img.style.display=top?.image?'block':'none';
   rankExpanded = false; // 새 검색 시 접은 상태로 초기화

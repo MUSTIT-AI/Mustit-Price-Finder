@@ -24,6 +24,13 @@ from flask import Flask, request, jsonify, send_from_directory, after_this_reque
 app = Flask(__name__, static_folder="static")
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150MB 업로드 제한
 
+try:
+    from naver_partner_sync import lookup_naver_reference_price
+except Exception as _e:
+    print(f"[naver-partner-sync] import 실패(무시하고 계속): {_e}")
+    def lookup_naver_reference_price(query):  # noqa: F811
+        return None
+
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 # Railway Volume이 마운트된 경우 /data 사용, 아니면 로컬 폴더 사용
 _DATA_DIR    = "/data" if os.path.isdir("/data") else BASE_DIR
@@ -2738,6 +2745,9 @@ def api_search():
             "enriched": False,
             "mustit_ref_price": mustit_ref,   # anchor 최저가 (하한선 기준점)
             "anchor_platform": anchor_plat,   # 기준점이 된 플랫폼명
+            # 스마트스토어 자유검색 대체: 몰 구분 없는 네이버 참고 최저가
+            # (naver_partner_sync 로컬DB 조회, 데이터 없으면 None)
+            "naver_reference_price": lookup_naver_reference_price(query),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -2821,6 +2831,7 @@ def api_enrich():
             "timing": timing,
             "mustit_ref_price": mustit_ref,   # anchor 최저가 (하한선 기준점)
             "anchor_platform": anchor_plat,   # 기준점이 된 플랫폼명
+            "naver_reference_price": lookup_naver_reference_price(query),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
