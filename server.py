@@ -25,11 +25,23 @@ app = Flask(__name__, static_folder="static")
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150MB 업로드 제한
 
 try:
-    from naver_partner_sync import lookup_naver_reference_price
+    from naver_partner_sync import lookup_naver_reference_price, lookup_naver_reference_price_by_mustit_ids
 except Exception as _e:
     print(f"[naver-partner-sync] import 실패(무시하고 계속): {_e}")
     def lookup_naver_reference_price(query):  # noqa: F811
         return None
+    def lookup_naver_reference_price_by_mustit_ids(item_nos):  # noqa: F811
+        return None
+
+
+def _naver_reference_price_for(query, by_plat):
+    """머스트잇 검색 결과의 itemNo로 먼저 정확히 조회하고, 못 찾으면 검색어
+    텍스트 매칭으로 폴백. ID 매칭이 더 정확하므로 우선한다."""
+    item_nos = [it.get("mustit_item_no") for it in by_plat.get("머스트잇", []) if it.get("mustit_item_no")]
+    result = lookup_naver_reference_price_by_mustit_ids(item_nos)
+    if result:
+        return result
+    return lookup_naver_reference_price(query)
 
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 # Railway Volume이 마운트된 경우 /data 사용, 아니면 로컬 폴더 사용
@@ -345,6 +357,9 @@ def _fetch_mustit_search(query, max_items=100, sort="LOW_PRICE"):
             "link": link,
             "brand": it.get("brandName", ""),
             "mallName": "머스트잇",
+            # 네이버 파트너센터 배치 데이터의 "쇼핑몰 상품ID"와 동일한 값 —
+            # naver_reference_price를 텍스트 매칭 대신 정확한 ID로 조회하는 데 사용.
+            "mustit_item_no": str(item_no),
         })
         if len(items) >= max_items:
             break
@@ -627,6 +642,7 @@ def search_by_platform(query, ref_price=0, top_n=10, skip_enrich=False):
                 "naver_rank": None,
                 "naver_nmid":       "",
                 "naver_product_id": "",
+                "mustit_item_no": item.get("mustit_item_no", ""),
             })
     # anchor: 기존엔 네이버 sim 1위 가격이었으나, D안에서는 머스트잇 자체 최저가로 대체.
     mustit_prices = [it["price"] for it in by_plat.get("머스트잇", [])]
@@ -2778,7 +2794,7 @@ def api_search():
             "anchor_platform": anchor_plat,   # 기준점이 된 플랫폼명
             # 스마트스토어 자유검색 대체: 몰 구분 없는 네이버 참고 최저가
             # (naver_partner_sync 로컬DB 조회, 데이터 없으면 None)
-            "naver_reference_price": lookup_naver_reference_price(query),
+            "naver_reference_price": _naver_reference_price_for(query, by_plat),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -2862,7 +2878,7 @@ def api_enrich():
             "timing": timing,
             "mustit_ref_price": mustit_ref,   # anchor 최저가 (하한선 기준점)
             "anchor_platform": anchor_plat,   # 기준점이 된 플랫폼명
-            "naver_reference_price": lookup_naver_reference_price(query),
+            "naver_reference_price": _naver_reference_price_for(query, by_plat),
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 400

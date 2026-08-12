@@ -396,6 +396,30 @@ def lookup_naver_reference_price(keyword):
         con.close()
 
 
+def lookup_naver_reference_price_by_mustit_ids(item_nos):
+    """머스트잇 검색 결과의 itemNo(=엑셀 '쇼핑몰 상품ID')로 정확히 매칭해 조회.
+    텍스트 매칭(lookup_naver_reference_price)보다 정확함 — 상품코드 검색처럼
+    상품명 텍스트로는 못 찾는 경우에도 머스트잇 자체 검색이 이미 정확한 상품을
+    찾아준 경우라면 그 itemNo로 바로 매칭 가능. 매칭 없으면 None."""
+    item_nos = [str(x) for x in (item_nos or []) if x]
+    if not item_nos or not os.path.exists(DB_PATH):
+        return None
+    con = sqlite3.connect(DB_PATH)
+    try:
+        placeholders = ",".join("?" * len(item_nos))
+        sql = (
+            "SELECT MIN(lowest_price), COUNT(*) FROM naver_ref_price "
+            f"WHERE lowest_price IS NOT NULL AND lowest_price > 0 "
+            f"AND mall_product_id IN ({placeholders})"
+        )
+        row = con.execute(sql, item_nos).fetchone()
+        if not row or row[1] == 0:
+            return None
+        return {"price": row[0], "match_count": row[1]}
+    finally:
+        con.close()
+
+
 # ── 결과 DB를 웹 서비스로 전송 (별도 Railway 서비스로 분리 배포된 경우) ────────────
 def push_db_to_web_service():
     """동기화 완료 후, 이 프로세스와 별도로 배포된 웹 서비스에 내부망(private
