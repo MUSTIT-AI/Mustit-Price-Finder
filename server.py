@@ -405,26 +405,38 @@ def _fetch_lotteon_search(query, max_items=100):
     """롯데온 자체 검색 API(lotteon.com/csearch/search/search). 세션/쿠키 불필요.
     검색 결과에는 판매자명이 없어(storeName 항상 빈값) seller는 이후 enrich 단계에서
     _fetch_lotteon_detail로 채워짐(scrape_seller_id에 이미 연결돼 있음)."""
+    def _call(offset, page_size, sort):
+        params = {"q": query, "render": "qapi", "platform": "pc",
+                  "collection_id": 9, "mallId": 1,
+                  "u2": page_size, "u3": page_size, "u39": offset, "u37": "true"}
+        if sort:
+            params["u16"] = sort
+        r = requests.get(
+            "https://www.lotteon.com/csearch/search/search",
+            params=params,
+            headers={"Accept": "application/json", "User-Agent": _UA,
+                     "Referer": "https://www.lotteon.com/"},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+
     items = []
     offset, page_size = 0, 60
     while len(items) < max_items and offset < 300:
         try:
-            r = requests.get(
-                "https://www.lotteon.com/csearch/search/search",
-                params={"q": query, "render": "qapi", "platform": "pc",
-                        "collection_id": 9, "mallId": 1,
-                        "u2": page_size, "u3": page_size, "u39": offset,
-                        "u16": "price.asc", "u37": "true"},
-                headers={"Accept": "application/json", "User-Agent": _UA,
-                         "Referer": "https://www.lotteon.com/"},
-                timeout=8,
-            )
-            if r.status_code != 200:
+            data = _call(offset, page_size, "price.asc")
+            if data is None:
                 break
-            data = r.json()
+            item_list = data.get("itemList") or []
+            # 롯데온 API 자체 버그: 특정 검색어(예: 상품코드류)에서 price.asc 정렬 시
+            # total>0인데 itemList가 빈 배열로 오는 경우가 있음 — 기본 정렬로 폴백.
+            if not item_list and (data.get("total") or 0) > 0:
+                data = _call(offset, page_size, None)
+                item_list = (data or {}).get("itemList") or []
         except Exception:
             break
-        item_list = data.get("itemList") or []
         if not item_list:
             break
         for it in item_list:
