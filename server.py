@@ -554,6 +554,23 @@ def _fetch_all_malls(query, max_items=100):
     return results
 
 
+_CODE_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{5,}$")
+
+def _code_query_tokens(query):
+    """검색어에 상품코드로 보이는 토큰(5자 이상 영숫자 연속)이 있으면 그 토큰들을 반환.
+    몰 자체 검색이 상품코드 검색 시 관련 없는 상품을 섞어 반환하는 경우가 있어
+    (예: 트렌비에서 특정 코드 검색 시 전혀 다른 상품이 최저가로 끼어듦), 상품명/브랜드에
+    해당 코드가 실제로 포함되는지 검증하는 용도. 일반 브랜드/키워드 검색어는
+    보통 이런 긴 순수 영숫자 토큰이 없어 필터가 적용되지 않음."""
+    return [t for t in query.split() if _CODE_TOKEN_RE.match(t)]
+
+def _item_matches_code_tokens(item, tokens):
+    if not tokens:
+        return True
+    hay = re.sub(r"\s+", "", (item.get("name", "") + item.get("brand", ""))).upper()
+    return any(t.upper() in hay for t in tokens)
+
+
 def search_by_platform(query, ref_price=0, top_n=10, skip_enrich=False):
     """각 플랫폼별로 독립적으로 가격 오름차순 정렬 후 top_n개 + 플랫폼 내부 순위 부여.
     D안: 네이버 쇼핑 검색 API 대신 4개몰(머스트잇/트렌비/SSG/롯데온) 자체 검색 API를
@@ -580,6 +597,7 @@ def search_by_platform(query, ref_price=0, top_n=10, skip_enrich=False):
 
     # ── 4개몰 자체 검색 병렬 호출 ────────────────────────────────────────────────
     raw_by_plat = _fetch_all_malls(query, max_items=100)
+    code_tokens = _code_query_tokens(query)
 
     by_plat  = {p: [] for p in PLATFORM_MAP}
     by_plat["기타"] = []
@@ -588,6 +606,7 @@ def search_by_platform(query, ref_price=0, top_n=10, skip_enrich=False):
         for item in raw_items:
             price = int(item.get("price", 0) or 0)
             if price == 0: continue
+            if not _item_matches_code_tokens(item, code_tokens): continue
             mall_raw = (item.get("mallName") or plat).strip()
             link_raw = item.get("link", "")
             if not link_raw: continue
