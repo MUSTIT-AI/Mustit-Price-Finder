@@ -25,6 +25,8 @@ import time
 import sqlite3
 import threading
 
+import requests
+
 try:
     from playwright.sync_api import sync_playwright
     _HAS_PLAYWRIGHT = True
@@ -394,6 +396,28 @@ def lookup_naver_reference_price(keyword):
         con.close()
 
 
+# ── 결과 DB를 웹 서비스로 전송 (별도 Railway 서비스로 분리 배포된 경우) ────────────
+def push_db_to_web_service():
+    """동기화 완료 후, 이 프로세스와 별도로 배포된 웹 서비스에 내부망(private
+    networking)으로 최신 DB 파일을 전송한다. NAVER_PARTNER_UPLOAD_URL 환경변수가
+    없으면(로컬 개발 등) 조용히 건너뜀. ACCESS_PASSWORD가 설정돼 있으면 웹 서비스의
+    Basic Auth를 통과하도록 같은 값을 헤더에 실어 보낸다."""
+    url = os.environ.get("NAVER_PARTNER_UPLOAD_URL", "").strip()
+    if not url or not os.path.exists(DB_PATH):
+        return
+    pw = os.environ.get("ACCESS_PASSWORD", "").strip()
+    auth = ("sync", pw) if pw else None
+    try:
+        with open(DB_PATH, "rb") as f:
+            r = requests.post(url, files={"file": ("naver_ref_price.db", f)}, auth=auth, timeout=180)
+        if r.status_code == 200:
+            print(f"[naver-partner-sync] DB 전송 완료 → {url}")
+        else:
+            print(f"[naver-partner-sync] DB 전송 실패({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        print(f"[naver-partner-sync] DB 전송 오류: {e}")
+
+
 # ── 백그라운드 주기 실행 ───────────────────────────────────────────────────────
 _sync_thread = None
 
@@ -411,6 +435,7 @@ def start_background_sync_thread():
         while True:
             try:
                 run_sync()
+                push_db_to_web_service()
             except Exception as e:
                 print(f"[naver-partner-sync] 동기화 실패: {e}")
             time.sleep(SYNC_INTERVAL_SEC)

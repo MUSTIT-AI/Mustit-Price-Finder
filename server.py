@@ -3552,6 +3552,25 @@ def api_debug_mustit_search():
     return jsonify(result)
 
 
+@app.route("/api/naver_partner/upload_db", methods=["POST"])
+def api_naver_partner_upload_db():
+    """별도 Railway 서비스(naver-partner-sync)가 배치 동기화를 마친 뒤
+    내부망(private networking)으로 이 웹 서비스의 볼륨에 최신 참고최저가
+    DB 파일을 전달하기 위한 라우트. 앱 전체 Basic Auth(ACCESS_PASSWORD)로
+    이미 보호됨. 받은 파일을 임시 경로에 먼저 쓰고 원자적으로 교체한다."""
+    try:
+        from naver_partner_sync import DB_PATH, _DATA_DIR as _NP_DATA_DIR
+        if "file" not in request.files:
+            return jsonify({"error": "file 파라미터 필요"}), 400
+        os.makedirs(_NP_DATA_DIR, exist_ok=True)
+        tmp_path = DB_PATH + ".tmp"
+        request.files["file"].save(tmp_path)
+        os.replace(tmp_path, DB_PATH)
+        return jsonify({"ok": True, "bytes": os.path.getsize(DB_PATH)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/mustit_csv/upload", methods=["POST"])
 def api_mustit_csv_upload():
     """머스트잇 판매자 CSV 업로드 → SQLite 저장.
