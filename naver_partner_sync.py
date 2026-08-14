@@ -68,25 +68,28 @@ COL_CATALOG_ID     = "가격비교 ID"
 SYNC_INTERVAL_SEC = int(os.environ.get("NAVER_PARTNER_SYNC_INTERVAL_SEC", str(90 * 60)))
 
 
+_MAX_PRODUCT_NAME_LEN = 40   # 웹서비스 볼륨(434MB, mustit_sellers.db 208MB와 공유)에
+                             # 200만행 규모 DB가 들어가야 해서 상품명 길이를 제한함
+
 def _init_db():
+    """최소 스키마만 저장 (조회에 실제로 쓰이는 컬럼만) — Railway 볼륨 용량
+    제약 때문에 catalog_name/catalog_id/naver_item_id/sell_price/reg_date/
+    brand는 저장하지 않고, product_name도 길이를 제한함. 필요해지면 나중에
+    볼륨을 늘리고 다시 추가 가능."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS naver_ref_price (
             mall_product_id TEXT PRIMARY KEY,
             product_name     TEXT,
-            brand            TEXT,
-            catalog_name     TEXT,
-            catalog_id       TEXT,
-            naver_item_id    TEXT,
-            sell_price       INTEGER,
             lowest_price     INTEGER,
-            reg_date         TEXT,
             updated_at       REAL
         )
     """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_product_name ON naver_ref_price(product_name)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_brand ON naver_ref_price(brand)")
+    # product_name/brand에 대한 인덱스는 만들지 않음: LIKE '%term%' 검색은
+    # B-tree 인덱스를 활용 못 해 어차피 풀스캔이고, 인덱스 용량이 실제
+    # 데이터보다 커서(200만행 기준 약 200MB) Railway 볼륨 용량(500MB)에
+    # 큰 부담이 됨 — mall_product_id 기준 조회(PRIMARY KEY)가 주 경로.
     con.commit()
     return con
 
@@ -324,27 +327,20 @@ def _upsert_excel_file(con, filepath):
         mall_pid = row[idx[COL_MALL_PRODUCT_ID]] if idx.get(COL_MALL_PRODUCT_ID) is not None else None
         if not mall_pid:
             continue
+        name_val = row[idx[COL_PRODUCT_NAME]] if idx.get(COL_PRODUCT_NAME) is not None else None
+        if name_val:
+            name_val = str(name_val)[:_MAX_PRODUCT_NAME_LEN]
         con.execute(
             """INSERT INTO naver_ref_price
-               (mall_product_id, product_name, brand, catalog_name, catalog_id,
-                naver_item_id, sell_price, lowest_price, reg_date, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
+               (mall_product_id, product_name, lowest_price, updated_at)
+               VALUES (?,?,?,?)
                ON CONFLICT(mall_product_id) DO UPDATE SET
-                 product_name=excluded.product_name, brand=excluded.brand,
-                 catalog_name=excluded.catalog_name, catalog_id=excluded.catalog_id,
-                 naver_item_id=excluded.naver_item_id, sell_price=excluded.sell_price,
-                 lowest_price=excluded.lowest_price, reg_date=excluded.reg_date,
-                 updated_at=excluded.updated_at""",
+                 product_name=excluded.product_name,
+                 lowest_price=excluded.lowest_price, updated_at=excluded.updated_at""",
             (
                 str(mall_pid),
-                row[idx[COL_PRODUCT_NAME]] if idx.get(COL_PRODUCT_NAME) is not None else None,
-                row[idx[COL_BRAND]] if idx.get(COL_BRAND) is not None else None,
-                row[idx[COL_CATALOG_NAME]] if idx.get(COL_CATALOG_NAME) is not None else None,
-                str(row[idx[COL_CATALOG_ID]]) if idx.get(COL_CATALOG_ID) is not None and row[idx[COL_CATALOG_ID]] else None,
-                str(row[idx[COL_NAVER_ITEM_ID]]) if idx.get(COL_NAVER_ITEM_ID) is not None and row[idx[COL_NAVER_ITEM_ID]] else None,
-                _num(row[idx[COL_SELL_PRICE]]) if idx.get(COL_SELL_PRICE) is not None else None,
+                name_val,
                 _num(row[idx[COL_LOWEST_PRICE]]) if idx.get(COL_LOWEST_PRICE) is not None else None,
-                str(row[idx[COL_REG_DATE]]) if idx.get(COL_REG_DATE) is not None and row[idx[COL_REG_DATE]] else None,
                 now,
             ),
         )
@@ -405,8 +401,10 @@ def run_sync():
 
 # ── 조회 (server.py에서 사용) ──────────────────────────────────────────────────
 def lookup_naver_reference_price(keyword):
-    """검색어(공백으로 여러 토큰 가능)와 상품명/브랜드가 모두 매칭되는 행 중
-    최저가(lowest_price)가 가장 낮은 값을 반환. 매칭 없으면 None."""
+    """검색어(공백으로 여러 토큰 가능)와 상품명이 모두 매칭되는 행 중
+    최저가(lowest_price)가 가장 낮은 값을 반환. 매칭 없으면 None.
+    (brand 컬럼은 볼륨 용량 제약으로 저장하지 않아 상품명만 검사함 —
+    상품코드 위주 검색은 어차피 mustit_item_no 정확 매칭이 우선 사용됨)"""
     if not keyword or not os.path.exists(DB_PATH):
         return None
     tokens = [t for t in keyword.strip().split() if t]
@@ -416,8 +414,8 @@ def lookup_naver_reference_price(keyword):
     try:
         clauses, params = [], []
         for t in tokens:
-            clauses.append("(product_name LIKE ? OR brand LIKE ?)")
-            params.extend([f"%{t}%", f"%{t}%"])
+            clauses.append("product_name LIKE ?")
+            params.append(f"%{t}%")
         sql = (
             "SELECT MIN(lowest_price), COUNT(*) FROM naver_ref_price "
             f"WHERE lowest_price IS NOT NULL AND lowest_price > 0 AND {' AND '.join(clauses)}"
