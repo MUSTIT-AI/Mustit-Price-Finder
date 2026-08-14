@@ -232,6 +232,8 @@ body{font-family:-apple-system,"Noto Sans KR",sans-serif;background:var(--bg);co
 .bm-mode:hover{background:var(--bg3)}
 .bm-mode.sel{border-color:var(--blue);background:var(--ib)}
 .bm-mode input[type=radio]{margin-top:2px;flex-shrink:0;accent-color:var(--blue);cursor:pointer}
+.bm-mode.disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
+.bm-mode.disabled input[type=radio]{cursor:not-allowed}
 .bm-mn{font-size:12px;font-weight:600;color:var(--tx);margin-bottom:2px}
 .bm-md{font-size:11px;color:var(--tx3);line-height:1.55}
 /* 진행 */
@@ -614,9 +616,9 @@ body{font-family:-apple-system,"Noto Sans KR",sans-serif;background:var(--bg);co
               <input type="radio" name="bmmode" value="full" onchange="updBmMode()">
               <div><div class="bm-mn">🔍 전체 조회</div><div class="bm-md">판매자 매칭 포함 · 각 플랫폼 직접 수집 · 건당 약 50초</div></div>
             </label>
-            <label class="bm-mode" id="bm-card-exposure">
-              <input type="radio" name="bmmode" value="exposure" onchange="updBmMode()">
-              <div><div class="bm-mn">📊 머스트잇 노출순위 조회</div><div class="bm-md">머스트잇만 · 가격순 TOP 10 · 네이버랭킹순 노출순위 · 건당 약 3초</div></div>
+            <label class="bm-mode disabled" id="bm-card-exposure" title="네이버쇼핑 검색 API 종료로 현재 사용할 수 없습니다">
+              <input type="radio" name="bmmode" value="exposure" onchange="updBmMode()" disabled>
+              <div><div class="bm-mn">📊 머스트잇 노출순위 조회 (현재 사용 불가)</div><div class="bm-md">네이버쇼핑 검색 API 종료로 비활성화됨 — 네이버 자체 랭킹 정보라 대체 불가</div></div>
             </label>
           </div>
         </div>
