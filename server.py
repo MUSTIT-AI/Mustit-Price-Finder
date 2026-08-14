@@ -618,10 +618,15 @@ def search_by_platform(query, ref_price=0, top_n=10, skip_enrich=False):
     by_plat["기타"] = []
     seen    = set()
     for plat, raw_items in raw_by_plat.items():
-        for item in raw_items:
+        priced_items = [it for it in raw_items if int(it.get("price", 0) or 0) > 0]
+        # 코드 필터는 몰별로 독립 적용: 이 몰 결과에 코드가 포함된 상품이
+        # 하나도 없으면(예: 상품명에 코드를 안 적는 몰) 필터링하지 않고 원본을
+        # 그대로 사용 — 잘못된 상품 제외(필터 목적)가 정상 매칭 전체 삭제로
+        # 이어지지 않도록 함.
+        filtered = [it for it in priced_items if _item_matches_code_tokens(it, code_tokens)]
+        use_items = filtered if filtered else priced_items
+        for item in use_items:
             price = int(item.get("price", 0) or 0)
-            if price == 0: continue
-            if not _item_matches_code_tokens(item, code_tokens): continue
             mall_raw = (item.get("mallName") or plat).strip()
             link_raw = item.get("link", "")
             if not link_raw: continue

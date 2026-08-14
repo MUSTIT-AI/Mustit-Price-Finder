@@ -17,6 +17,9 @@ naver_next.json
 naver_raw.html
 naver_partner_state.json
 naver_partner_downloads/
+naver_partner_debug.*
+naver_partner_stall.*
+naver_ref_price.db
 
 # ── Python ────────────────────────────────────────────────────
 __pycache__/

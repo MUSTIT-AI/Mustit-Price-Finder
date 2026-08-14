@@ -18,12 +18,19 @@ Excel로 배치 다운로드 → 병합 → 로컬DB화)을 가져와, "몰별 �
 (자동화 도구의 도메인 접근이 차단되어 있음).
 """
 import os
+import sys
 import re
 import glob
 import json
 import time
 import sqlite3
 import threading
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 import requests
 
@@ -43,6 +50,8 @@ DOWNLOAD_DIR   = os.path.join(_DATA_DIR, "naver_partner_downloads")
 DB_PATH        = os.path.join(_DATA_DIR, "naver_ref_price.db")
 
 PARTNER_ENTRY_URL = "https://center.shopping.naver.com/product/manage"
+SERVICE_LIST_URL  = "https://adcenter.shopping.naver.com/iframe/product/manage/service/list.nhn"
+IFRAME_URL_HINT   = "adcenter.shopping.naver.com/iframe/product/manage"
 
 # 사용자가 확인해준 다운로드 Excel 컬럼 헤더 (그대로 매핑에 사용)
 COL_PRODUCT_NAME   = "상품명"
@@ -57,7 +66,6 @@ COL_LOWEST_PRICE   = "가격비교 최저가"
 COL_CATALOG_ID     = "가격비교 ID"
 
 SYNC_INTERVAL_SEC = int(os.environ.get("NAVER_PARTNER_SYNC_INTERVAL_SEC", str(90 * 60)))
-_BATCH_TIMEOUT_MS = 3 * 60 * 1000   # 배치당 최대 대기 (344개 연속 배치 실측 검증 완료, 3분으로 여유있게 설정)
 
 
 def _init_db():
@@ -118,131 +126,161 @@ def _get_authed_context(pw, headless=True):
     return browser, context
 
 
-# ── 배치 다운로드 ─────────────────────────────────────────────────────────────
-def _row_has(row, label):
-    return row.get_by_text(label, exact=True).count() > 0
+# ── 배치 다운로드 (PM이 검증한 다른 서비스 PoC 방식 그대로 채용 — 1000건당 3.4초 실측) ──
+def _wait_for_content_frame(page, timeout_ms=15000):
+    """상품관리 iframe(실제 URL이 IFRAME_URL_HINT를 포함하는 프레임)을 찾는다.
+    page.frame_locator('iframe')로 접근하는 것보다, 실제 Frame 객체를 직접
+    찾는 이 방식이 frame.goto() 이후에도 안정적으로 재사용 가능하다."""
+    elapsed, step = 0, 300
+    while elapsed < timeout_ms:
+        for frame in page.frames:
+            if IFRAME_URL_HINT in frame.url:
+                return frame
+        page.wait_for_timeout(step)
+        elapsed += step
+    return None
 
 
-def _click_row_label(row, label):
-    """행 안에서 label 텍스트 요소를 찾아, 가장 가까운 클릭 가능한 조상
-    (button/a/[onclick]/[role=button]/li/td)을 JS로 직접 클릭한다.
-    Playwright의 가시성 액션어빌리티 체크를 완전히 건너뛰어, 접근성용
-    숨김 텍스트(<span class="blind">) 패턴에도 안전하게 동작한다."""
-    target = row.get_by_text(label, exact=True).first
-    target.evaluate(
-        "(el) => { "
-        "  const c = el.closest('button, a, [onclick], [role=button], li, td'); "
-        "  (c || el).click(); "
-        "}"
-    )
+def _get_last_row_label(popup):
+    els = popup.locator("#downloadList tr .num")
+    n = els.count()
+    if n == 0:
+        return None
+    return els.nth(n - 1).inner_text().strip()
 
 
-def _open_download_popup(page, inner):
+def _open_download_popup(page):
+    """상품관리 iframe에서 '가격비교매칭완료' 필터를 적용한 뒤 전체 엑셀 분할
+    다운로드 팝업을 연다. 이 필터를 먼저 적용하는 것이 PM이 확인한 다른
+    서비스 PoC와의 핵심 차이 — 필터 없이 하면 배치당 처리시간이 10배 이상
+    느려짐(전체 336만건 중 미매칭 상품까지 서버가 훑는 것으로 추정)."""
+    content_frame = _wait_for_content_frame(page)
+    if content_frame is None:
+        raise RuntimeError("상품관리 iframe을 찾지 못함")
+
+    content_frame.goto(SERVICE_LIST_URL)
+    content_frame.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
+
+    # goto 이후 프레임 참조가 끊길 수 있어 재확인
+    content_frame = _wait_for_content_frame(page)
+    if content_frame is None:
+        raise RuntimeError("상품관리 iframe(goto 이후)을 찾지 못함")
+
+    try:
+        content_frame.locator('a[status="MODEL_MATCHED"]').first.click()
+        page.wait_for_timeout(1500)
+    except Exception as e:
+        print(f"[naver-partner-sync] 가격비교매칭완료 필터 클릭 실패(무시하고 진행): {e}")
+
     with page.context.expect_page(timeout=30000) as popup_info:
-        inner.get_by_text("엑셀 다운", exact=False).first.click()
-        inner.get_by_text("전체 엑셀 분할 다운로드", exact=False).first.click()
+        content_frame.locator("#excelDown a.tab_toggle").click()
+        page.wait_for_timeout(500)
+        content_frame.locator("#excelDown li[key='whole'] a").click()
     popup = popup_info.value
-    popup.wait_for_load_state("domcontentloaded", timeout=30000)
+    try:
+        popup.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    popup.wait_for_timeout(2000)
     return popup
 
 
-def _dismiss_modal_if_present(popup):
-    """'이미 진행중인 다운로드가 있습니다' 같은 커스텀 확인 모달이 떠 있으면 닫는다."""
-    try:
-        ok_btn = popup.get_by_text("확인", exact=True)
-        if ok_btn.count() > 0:
-            ok_btn.first.click()
-            popup.wait_for_timeout(500)
-            return True
-    except Exception:
-        pass
-    return False
-
-
-_BATCH_COOLDOWN_SEC = 3   # 배치 사이 서버 쿨다운 (5초로 3배치 연속 성공 확인됨, 여유 두고 3~5초 사용)
-_MODAL_BACKOFF_SEC = [10, 30, 60]   # '이미 진행중' 모달을 만났을 때 재시도 전 대기(점증)
-
-def _download_all_batches(page, inner, out_dir):
-    """'전체 엑셀 분할 다운로드' 팝업 하나를 계속 열어둔 채 배치를 순서대로 처리한다.
-    배치 사이에 서버 쿨다운(_BATCH_COOLDOWN_SEC)이 필요함이 실측으로 확인됨 —
-    쿨다운 없이 바로 다음 배치를 요청하면 '이미 진행중인 다운로드가 있습니다'
-    모달이 뜨며 막힌다. 그래도 모달이 뜨면 점증 백오프로 재시도한다.
-    inner: 상품 관리 화면이 들어있는 iframe의 frame_locator (엑셀 다운 버튼도 이 안에 있음).
+def _download_all_batches(page, out_dir):
+    """전체 엑셀 분할 다운로드 팝업 하나를 계속 열어둔 채 배치를 순서대로 처리.
+    각 배치는 '#downloadList a.btn_down'의 마지막 행을 클릭 → 새 행(다음 배치)이
+    나타날 때까지 대기, 이 한 번의 클릭으로 처리+다운로드가 함께 일어남
+    (다운로드는 context 레벨 'download' 이벤트로 수집). '이미 진행중인 다운로드'
+    다이얼로그가 뜨면 점증 대기(3×시도횟수초) 후 같은 행을 재클릭.
     저장된 파일 경로 리스트 반환."""
     os.makedirs(out_dir, exist_ok=True)
-    saved = []
-    seen_ranges = set()
-    stalled_rounds = 0
-    is_first_batch = True
+    downloaded = []
+    page.context.on("download", lambda d: downloaded.append(d))
 
-    popup = _open_download_popup(page, inner)
-    _dismiss_modal_if_present(popup)
+    last_dialog_message = {"text": None}
 
-    while stalled_rounds < 3:
-        rows = popup.locator("table tr")
-        row_count = rows.count()
-        target = None
-        for i in range(row_count):
-            row = rows.nth(i)
-            text = row.inner_text()
-            m = re.search(r"(\d+)\s*[~\-]\s*(\d+)", text)
-            if not m:
-                continue
-            range_key = m.group(0)
-            if range_key in seen_ranges:
-                continue
-            target = (row, range_key)
+    def _on_dialog(dialog):
+        last_dialog_message["text"] = dialog.message
+        dialog.accept()
+    page.on("dialog", _on_dialog)
+
+    def _dismiss_html_modal(p):
+        """'이미 진행중인 다운로드가 있습니다' 등은 네이티브 브라우저 다이얼로그가
+        아니라 커스텀 HTML 모달(.swal-overlay)로 뜨는 경우가 있어, page.on('dialog')
+        로는 못 잡는다. 확인 버튼을 직접 클릭해서 닫는다."""
+        try:
+            overlay = p.locator(".swal-overlay--show-modal")
+            if overlay.count() > 0:
+                p.locator(".swal-button--confirm").first.click(timeout=3000)
+                p.wait_for_timeout(300)
+                return True
+        except Exception:
+            pass
+        return False
+
+    popup = _open_download_popup(page)
+    popup.on("dialog", _on_dialog)
+
+    MAX_RETRY = 5
+    i = 0
+    while True:
+        if popup.locator("#downloadList a.btn_down").count() == 0:
+            print(f"[naver-partner-sync] 더 이상 받을 배치가 없음 - 총 {i}개로 종료")
             break
 
-        if target is None:
-            popup.wait_for_timeout(3000)
-            stalled_rounds += 1
-            continue
+        i += 1
+        label_before = _get_last_row_label(popup)
+        new_row_ok = False
+        for attempt in range(1, MAX_RETRY + 1):
+            last_dialog_message["text"] = None
+            _dismiss_html_modal(popup)
+            try:
+                popup.locator("#downloadList a.btn_down").last.click()
+            except Exception as e:
+                print(f"[naver-partner-sync] 배치 {i} 다운로드 버튼 클릭 실패: {e}")
+                break
+            try:
+                popup.wait_for_function(
+                    "prevLabel => { "
+                    "  const els = document.querySelectorAll('#downloadList tr .num'); "
+                    "  if (!els.length) return false; "
+                    "  const last = els[els.length - 1].textContent.trim(); "
+                    "  return last !== prevLabel; }",
+                    arg=label_before,
+                    timeout=15000,
+                )
+                new_row_ok = True
+                break
+            except Exception:
+                modal_seen = _dismiss_html_modal(popup)
+                is_conflict = modal_seen or (
+                    last_dialog_message["text"] and "이미 진행중인 다운로드" in last_dialog_message["text"]
+                )
+                if is_conflict:
+                    wait_s = 3 * attempt
+                    popup.wait_for_timeout(wait_s * 1000)
+                    continue
+                popup.wait_for_timeout(2000)
 
-        row, range_key = target
-        progressed = False
-        try:
-            if not is_first_batch:
-                popup.wait_for_timeout(_BATCH_COOLDOWN_SEC * 1000)
-            is_first_batch = False
-
-            if _row_has(row, "다운로드") and not _row_has(row, "파일다운"):
-                _click_row_label(row, "다운로드")
-                deadline = time.time() + _BATCH_TIMEOUT_MS / 1000
-                backoff_used = 0
-                while not _row_has(row, "파일다운") and time.time() < deadline:
-                    if _dismiss_modal_if_present(popup):
-                        wait_sec = _MODAL_BACKOFF_SEC[min(backoff_used, len(_MODAL_BACKOFF_SEC) - 1)]
-                        backoff_used += 1
-                        popup.wait_for_timeout(wait_sec * 1000)
-                        _click_row_label(row, "다운로드")
-                    popup.wait_for_timeout(2000)
-                if not _row_has(row, "파일다운"):
-                    raise TimeoutError("파일다운 대기 타임아웃")
-
-            with popup.expect_download(timeout=_BATCH_TIMEOUT_MS) as dl_info:
-                _click_row_label(row, "파일다운")
-            download = dl_info.value
-
-            fname = f"batch_{range_key.replace('~', '_').replace('-', '_')}.xlsx"
-            fpath = os.path.join(out_dir, fname)
-            download.save_as(fpath)
-            saved.append(fpath)
-            seen_ranges.add(range_key)
-            progressed = True
-        except Exception as e:
-            print(f"[naver-partner-sync] 배치 {range_key} 처리 실패: {e}")
+        if not new_row_ok:
+            print(f"[naver-partner-sync] 배치 {i}에서 정지(재시도 {MAX_RETRY}회 소진) - 종료")
             try:
                 os.makedirs(_DATA_DIR, exist_ok=True)
-                popup.screenshot(
-                    path=os.path.join(_DATA_DIR, f"naver_partner_stall_{range_key.replace('~', '_')}.png"),
-                    full_page=True,
-                )
+                popup.screenshot(path=os.path.join(_DATA_DIR, "naver_partner_stall.png"), full_page=True)
+                with open(os.path.join(_DATA_DIR, "naver_partner_stall.html"), "w", encoding="utf-8") as f:
+                    f.write(popup.content())
             except Exception:
                 pass
-            seen_ranges.add(range_key)
+            break
 
-        stalled_rounds = 0 if progressed else stalled_rounds + 1
+    saved = []
+    for d in downloaded:
+        fpath = os.path.join(out_dir, d.suggested_filename)
+        try:
+            d.save_as(fpath)
+            saved.append(fpath)
+        except Exception as e:
+            print(f"[naver-partner-sync] 다운로드 저장 실패: {e}")
 
     popup.close()
     return saved
@@ -326,15 +364,11 @@ def run_sync():
         browser, context = _get_authed_context(pw, headless=True)
         try:
             page = context.new_page()
-            page.goto(PARTNER_ENTRY_URL, wait_until="domcontentloaded", timeout=60000)
+            page.goto(PARTNER_ENTRY_URL, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(1500)
             try:
-                # 실제 상품 관리 화면은 iframe 안에 렌더링됨 (embrace-token-at-url 경유)
-                page.wait_for_selector("iframe", timeout=15000)
-                inner = page.frame_locator("iframe")
-                inner.get_by_role("link", name="서비스 상품", exact=True).click(timeout=15000)
                 batch_dir = os.path.join(DOWNLOAD_DIR, str(int(time.time())))
-                files = _download_all_batches(page, inner, batch_dir)
+                files = _download_all_batches(page, batch_dir)
             except Exception:
                 os.makedirs(_DATA_DIR, exist_ok=True)
                 shot_path = os.path.join(_DATA_DIR, "naver_partner_debug.png")
@@ -343,7 +377,7 @@ def run_sync():
                     page.screenshot(path=shot_path, full_page=True)
                     with open(html_path, "w", encoding="utf-8") as f:
                         f.write(page.content())
-                    print(f"[naver-partner-sync] 실패 — 디버그용 스크린샷/HTML 저장: {shot_path}, {html_path}")
+                    print(f"[naver-partner-sync] 실패 - 디버그용 스크린샷/HTML 저장: {shot_path}, {html_path}")
                 except Exception as _e2:
                     print(f"[naver-partner-sync] 디버그 캡처도 실패: {_e2}")
                 raise
@@ -435,7 +469,7 @@ def push_db_to_web_service():
         with open(DB_PATH, "rb") as f:
             r = requests.post(url, files={"file": ("naver_ref_price.db", f)}, auth=auth, timeout=180)
         if r.status_code == 200:
-            print(f"[naver-partner-sync] DB 전송 완료 → {url}")
+            print(f"[naver-partner-sync] DB 전송 완료 -> {url}")
         else:
             print(f"[naver-partner-sync] DB 전송 실패({r.status_code}): {r.text[:200]}")
     except Exception as e:
@@ -452,7 +486,7 @@ def start_background_sync_thread():
     if _sync_thread is not None:
         return
     if not os.path.exists(STATE_PATH):
-        print(f"[naver-partner-sync] 로그인 세션 없음({STATE_PATH}) — 백그라운드 동기화 건너뜀")
+        print(f"[naver-partner-sync] 로그인 세션 없음({STATE_PATH}) - 백그라운드 동기화 건너뜀")
         return
 
     def _loop():
