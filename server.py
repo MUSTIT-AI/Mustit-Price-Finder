@@ -1018,11 +1018,19 @@ def _get_pw_ssg_context():
     return _PW_SSG_CTX
 
 
-def _fetch_mustit_html_playwright(pd_id):
+def _fetch_mustit_html_playwright(pd_id, _reset_on_entry=False):
     """Playwright로 머스트잇 상품 상세 HTML 반환 (Cloudflare JS 챌린지 통과).
     공유 컨텍스트를 사용해 세션 쿠키를 유지한다.
+
+    공유 컨텍스트(_PW_CTX)는 여러 스레드(enrich_sellers_in_place의 동시 조회)가
+    함께 참조한다. 한 스레드가 리다이렉트/챌린지를 만나 컨텍스트를 close()하고
+    초기화하는 순간, 그 컨텍스트를 이미 붙잡고 있던 다른 스레드의 page.goto/content
+    호출이 "closed" 예외를 던질 수 있다 — 이 경우 그냥 실패 처리하면 판매자가
+    조용히 미노출되므로, 새 컨텍스트로 한 번 더 재시도한다(_reset_on_entry=True).
     """
     global _PW_CTX
+    if _reset_on_entry:
+        _PW_CTX = None
     ctx = _get_pw_context()
     if not ctx:
         return None
@@ -1080,6 +1088,10 @@ def _fetch_mustit_html_playwright(pd_id):
         print(f"[mustit-pw] error pd_id={pd_id}: {e}")
         # 컨텍스트가 깨진 경우 초기화
         _PW_CTX = None
+        # 동시 조회 중이던 다른 스레드가 컨텍스트를 닫아서 발생한 예외일 수 있으므로
+        # 새 컨텍스트로 한 번만 재시도 (무한 재귀 방지를 위해 최초 1회만)
+        if not _reset_on_entry:
+            return _fetch_mustit_html_playwright(pd_id, _reset_on_entry=True)
         return None
 
 
