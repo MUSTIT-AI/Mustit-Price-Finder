@@ -2887,16 +2887,12 @@ def api_enrich():
                     return forms
 
                 norm_sid = _normalize(sid)
-                # 디버그: 해당 플랫폼 아이템들의 seller 목록 출력
-                _avail = [it.get("seller","") for it in by_plat.get(plat, [])]
-                print(f"[match] plat={plat} sid={sid!r} norm={norm_sid!r} avail={_avail[:5]}")
                 def _seller_match(text, _ns=norm_sid, _mf=_match_forms):
                     """정규화된 sid가 seller의 매칭 형태 중 하나와 정확 일치"""
                     return bool(_ns and _ns in _mf(text))
                 found = next((it for it in by_plat.get(plat, [])
                               if _seller_match(it.get("seller") or "")
                               or _seller_match(it.get("mallName") or "")), None)
-                print(f"[match] → {'FOUND: '+found.get('seller','?') if found else 'NOT FOUND'}")
                 row["cells"][plat] = found
             rows.append(row)
         timing = {
