@@ -420,10 +420,11 @@ def _fetch_lotteon_search(query, max_items=100):
     """롯데온 자체 검색 API(lotteon.com/csearch/search/search). 세션/쿠키 불필요.
     검색 결과에는 판매자명이 없어(storeName 항상 빈값) seller는 이후 enrich 단계에서
     _fetch_lotteon_detail로 채워짐(scrape_seller_id에 이미 연결돼 있음)."""
-    def _call(offset, page_size, sort):
+    def _call(offset, page_size, sort, u2_override=None):
         params = {"q": query, "render": "qapi", "platform": "pc",
                   "collection_id": 9, "mallId": 1,
-                  "u2": page_size, "u3": page_size, "u39": offset, "u37": "true"}
+                  "u2": page_size if u2_override is None else u2_override,
+                  "u3": page_size, "u39": offset, "u37": "true"}
         if sort:
             params["u16"] = sort
         r = requests.get(
@@ -439,21 +440,30 @@ def _fetch_lotteon_search(query, max_items=100):
 
     items = []
     offset, page_size = 0, 60
+    total_known = None
     while len(items) < max_items and offset < 300:
         try:
             data = _call(offset, page_size, "price.asc")
             if data is None:
                 break
             item_list = data.get("itemList") or []
-            # 롯데온 API 자체 버그: 특정 검색어(예: 상품코드류)에서 price.asc 정렬 시
-            # total>0인데 itemList가 빈 배열로 오는 경우가 있음 — 기본 정렬로 폴백.
+            # 롯데온 API 자체 버그: 검색 결과가 적은(상품코드류) 검색어에서 첫 페이지
+            # (offset=0)에 u2(페이지 크기)를 명시하면 total>0인데 itemList가 빈 배열로
+            # 오는 경우가 있음 — 기본 정렬로 1차 폴백, 그래도 비어있으면 u2=0("제한
+            # 없음")으로 재시도. u2=0은 offset>0(다음 페이지)에서는 오히려 깨지는 게
+            # 확인돼서 첫 페이지(offset==0)에서만 시도한다.
             if not item_list and (data.get("total") or 0) > 0:
                 data = _call(offset, page_size, None)
+                item_list = (data or {}).get("itemList") or []
+            if not item_list and offset == 0:
+                data = _call(offset, page_size, "price.asc", u2_override=0)
                 item_list = (data or {}).get("itemList") or []
         except Exception:
             break
         if not item_list:
             break
+        if total_known is None:
+            total_known = data.get("total") or 0
         for it in item_list:
             price_info = it.get("priceInfo") or {}
             price_str = re.sub(r"[^\d]", "", str(price_info.get("finalPrice", "0")))
@@ -475,6 +485,11 @@ def _fetch_lotteon_search(query, max_items=100):
             if len(items) >= max_items:
                 break
         offset += page_size
+        # 롯데온 API가 offset이 total을 넘어가면 빈 배열 대신 첫 페이지를 그대로
+        # 다시 돌려주는 경우가 있어(무한 재수집 방지), total을 알게 된 시점부터는
+        # 이미 다 수집했으면 더 이상 페이지를 요청하지 않는다.
+        if total_known and offset >= total_known:
+            break
     items.sort(key=lambda x: x["price"])
     return items
 
